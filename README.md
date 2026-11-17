@@ -40,12 +40,18 @@ Platform agen AI otonom yang menghubungkan **OpenMausBot** (orkestrasi multi-age
 
 ## Cara Menjalankan Tanpa Docker (1 Perintah)
 
-Gunakan skrip `scripts/start-local.sh` untuk menjalankan **9Router**, **OpenMausBot API**, **Worker** (jika `redis-server` terpasang; jika tidak, otomatis berjalan dalam mode sinkron dengan SQLite):
+Gunakan skrip berikut untuk menjalankan **9Router**, **OpenMausBot API**, dan **Worker** (jika `redis-server` terpasang; jika tidak, otomatis berjalan dalam mode sinkron dengan SQLite):
 
-```bash
-chmod +x scripts/start-local.sh
-./scripts/start-local.sh
-```
+- **Linux / macOS / Git Bash:**
+  ```bash
+  chmod +x scripts/start-local.sh
+  ./scripts/start-local.sh
+  ```
+
+- **Windows (PowerShell):**
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+  ```
 
 ## Menguji Alur End-to-End
 
