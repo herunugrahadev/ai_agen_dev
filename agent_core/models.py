@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -12,8 +12,10 @@ class TaskStatus(str, Enum):
     QUEUED = "queued"
     PLANNING = "planning"
     EXECUTING = "executing"
+    AWAITING_APPROVAL = "awaiting_approval"
     REVIEWING = "reviewing"
     COMPLETED = "completed"
+    REJECTED = "rejected"
     FAILED = "failed"
     NEEDS_REVISION = "needs_revision"
 
@@ -99,6 +101,30 @@ class TokenUsage(BaseModel):
     total_tokens: int = 0
 
 
+class PendingApproval(BaseModel):
+    """Represents a suspended destructive tool call awaiting human approval."""
+
+    approval_id: str = Field(default_factory=lambda: str(uuid4()))
+    task_id: str
+    tool_name: str
+    tool_call_id: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(default="Destructive or external-impact tool requires human approval.")
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    decided_by: str | None = None
+    decision_comment: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    decided_at: datetime | None = None
+
+
+class ApprovalWebhookPayload(BaseModel):
+    """Webhook payload sent by human operator to approve or reject a pending tool call."""
+
+    decision: Literal["approve", "reject"]
+    reviewer: str = Field(default="human-operator", min_length=1)
+    comment: str | None = None
+
+
 class WorkflowResult(BaseModel):
     """Complete end-to-end execution result stored in PostgreSQL and returned to user."""
 
@@ -108,6 +134,7 @@ class WorkflowResult(BaseModel):
     plan: PlanOutput | None = None
     execution: ExecutorOutput | None = None
     review: ReviewOutput | None = None
+    pending_approval: PendingApproval | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     error: str | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

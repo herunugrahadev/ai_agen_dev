@@ -12,6 +12,8 @@ from agent_core.config import get_settings
 from agent_core.llm_client import NineRouterClient
 from agent_core.logging_utils import get_logger, setup_logging
 from agent_core.models import (
+    ApprovalWebhookPayload,
+    PendingApproval,
     TaskRequest,
     TaskStatus,
     WebhookPayload,
@@ -19,7 +21,10 @@ from agent_core.models import (
 )
 from agent_core.storage.postgres_store import PostgresStore
 from agent_core.storage.redis_store import RedisStore
-from agent_core.workflow.orchestrator import WorkflowOrchestrator
+from agent_core.workflow.orchestrator import (
+    ApprovalNotFoundError,
+    WorkflowOrchestrator,
+)
 
 logger = get_logger("openmausbot.api")
 
@@ -195,3 +200,58 @@ async def list_tasks(
 async def get_task_records(task_id: str, request: Request) -> list[dict]:
     """List structured records persisted by the database_writer tool for a task."""
     return await request.app.state.postgres.get_extracted_records(task_id)
+
+
+@app.get("/api/v1/approvals/{approval_id}", response_model=PendingApproval)
+async def get_pending_approval(approval_id: str, request: Request) -> PendingApproval:
+    """Inspect a suspended HITL approval stored in Redis."""
+    redis_store = request.app.state.redis
+    if redis_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis is disabled; HITL approval state store is unavailable.",
+        )
+    state = await redis_store.get_pending_approval_state(approval_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pending approval '{approval_id}' not found or expired.",
+        )
+    return PendingApproval.model_validate(state["approval"])
+
+
+@app.post("/api/v1/webhook/approvals/{approval_id}", response_model=WorkflowResult)
+async def approval_webhook(
+    approval_id: str,
+    payload: ApprovalWebhookPayload,
+    request: Request,
+    x_webhook_signature: str | None = Header(default=None),
+) -> WorkflowResult:
+    """HITL webhook endpoint to approve or reject a suspended destructive tool call."""
+    settings = request.app.state.settings
+    if x_webhook_signature is not None:
+        raw_body = await request.body()
+        expected_sig = hmac.new(
+            settings.webhook_secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        provided_sig = x_webhook_signature.removeprefix("sha256=")
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid webhook signature.",
+            )
+
+    try:
+        return await request.app.state.orchestrator.resume_approval(approval_id, payload)
+    except ApprovalNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc

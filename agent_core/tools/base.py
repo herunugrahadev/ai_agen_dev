@@ -13,6 +13,7 @@ class BaseTool(ABC):
     name: str
     description: str
     parameters_schema: dict[str, Any]
+    requires_approval: bool = False
 
     def to_openai_schema(self) -> dict[str, Any]:
         """Convert tool definition to OpenAI Chat Completions tool schema."""
@@ -45,6 +46,17 @@ class ToolRegistry:
     def get(self, name: str) -> BaseTool | None:
         """Retrieve a tool by name."""
         return self._tools.get(name)
+
+    def is_approval_required(
+        self,
+        name: str,
+        destructive_names: set[str] | None = None,
+    ) -> bool:
+        """Return True if the tool is marked destructive or requires HITL approval."""
+        tool = self.get(name)
+        if tool is not None and tool.requires_approval:
+            return True
+        return bool(destructive_names and name in destructive_names)
 
     def openai_schemas(self) -> list[dict[str, Any]]:
         """Return OpenAI tool schemas for all registered tools."""

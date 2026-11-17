@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://redis:6379/0")
     redis_task_queue_key: str = Field(default="openmausbot:tasks:queue")
     redis_memory_ttl_seconds: int = Field(default=3600, ge=60)
+    redis_approval_ttl_seconds: int = Field(default=86400, ge=60)
+
+    # Human-in-the-Loop (HITL)
+    destructive_tools: list[str] = Field(
+        default_factory=lambda: ["database_deleter", "email_sender"]
+    )
 
     # PostgreSQL (Persistent State & Execution History)
     database_url: str = Field(

@@ -67,6 +67,33 @@ class RedisStore:
             return None
         return json.loads(raw)
 
+    async def save_pending_approval_state(
+        self,
+        approval_id: str,
+        state_payload: dict[str, Any],
+        ttl_seconds: int | None = None,
+    ) -> None:
+        """Safely persist suspended agent execution state in Redis while awaiting HITL approval."""
+        redis_key = f"openmausbot:approval:{approval_id}"
+        ttl = ttl_seconds or self.settings.redis_approval_ttl_seconds
+        await self._client.setex(redis_key, ttl, json.dumps(state_payload, default=str))
+
+    async def get_pending_approval_state(
+        self,
+        approval_id: str,
+    ) -> dict[str, Any] | None:
+        """Retrieve suspended agent state from Redis by approval_id."""
+        redis_key = f"openmausbot:approval:{approval_id}"
+        raw = await self._client.get(redis_key)
+        if raw is None:
+            return None
+        return json.loads(raw)
+
+    async def delete_pending_approval_state(self, approval_id: str) -> None:
+        """Remove suspended approval state from Redis after resolution."""
+        redis_key = f"openmausbot:approval:{approval_id}"
+        await self._client.delete(redis_key)
+
     async def close(self) -> None:
         """Close the Redis connection pool."""
         await self._client.aclose()
