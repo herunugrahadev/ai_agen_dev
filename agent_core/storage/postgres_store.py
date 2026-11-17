@@ -88,9 +88,26 @@ class PostgresStore:
         )
 
     async def init_db(self) -> None:
-        """Create database tables if they do not exist."""
+        """Create database tables and apply lightweight schema migrations if needed."""
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            dialect = conn.dialect.name
+            if dialect == "sqlite":
+                rows = (
+                    await conn.execute(text("PRAGMA table_info(task_executions)"))
+                ).fetchall()
+                existing_cols = {row[1] for row in rows}
+                if "pending_approval_json" not in existing_cols:
+                    await conn.execute(
+                        text("ALTER TABLE task_executions ADD COLUMN pending_approval_json JSON")
+                    )
+            else:
+                await conn.execute(
+                    text(
+                        "ALTER TABLE task_executions "
+                        "ADD COLUMN IF NOT EXISTS pending_approval_json JSON"
+                    )
+                )
 
     async def ping(self) -> bool:
         """Verify database connectivity."""
