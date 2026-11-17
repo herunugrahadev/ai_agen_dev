@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import FloatingAgentChat from "@/components/FloatingAgentChat";
 
 interface AgentTokenMetric {
   agent: string;
@@ -423,6 +424,8 @@ export default function DashboardPage() {
           </table>
         </div>
       </section>
+
+      <FloatingAgentChat apiBase={API_BASE} onExecutionComplete={fetchMetrics} />
     </main>
   );
 }
