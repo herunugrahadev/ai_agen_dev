@@ -1,0 +1,1 @@
+"""OpenMausBot background worker package."""

@@ -1,0 +1,172 @@
+# 9Router Unified AI Gateway Configuration
+# Compatible with 9Router (decolua/9router) OpenAI-compatible proxy on port 20128.
+# All OpenMausBot agents send requests to http://9router:20128/v1 using virtual model aliases.
+
+version: "1.0"
+
+server:
+  host: "0.0.0.0"
+  port: 20128
+  request_timeout_ms: 120000
+  log_format: "json"
+  cors_enabled: true
+
+# Upstream provider definitions (API keys injected via environment variables)
+providers:
+  anthropic:
+    type: "anthropic"
+    api_key: "${ANTHROPIC_API_KEY}"
+    timeout_ms: 90000
+    max_retries: 2
+
+  openai:
+    type: "openai"
+    api_key: "${OPENAI_API_KEY}"
+    timeout_ms: 90000
+    max_retries: 2
+
+  gemini:
+    type: "gemini"
+    api_key: "${GEMINI_API_KEY}"
+    timeout_ms: 60000
+    max_retries: 2
+
+  groq:
+    type: "openai-compatible"
+    base_url: "https://api.groq.com/openai/v1"
+    api_key: "${GROQ_API_KEY}"
+    timeout_ms: 30000
+    max_retries: 2
+
+  deepseek:
+    type: "openai-compatible"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    timeout_ms: 60000
+    max_retries: 2
+
+# Global resilience, circuit breaker, and HTTP 429 fallback policy
+resilience:
+  retry_on_status: [429, 500, 502, 503, 504]
+  backoff:
+    strategy: "exponential_jitter"
+    initial_delay_ms: 500
+    max_delay_ms: 15000
+    multiplier: 2.0
+  circuit_breaker:
+    failure_threshold: 5
+    cooldown_seconds: 60
+    half_open_max_requests: 2
+  rate_limit_rotation:
+    enabled: true
+    on_429_action: "immediate_fallback"
+    respect_retry_after_header: true
+
+# Virtual Model Routing Tiers for OpenMausBot
+combos:
+  # Tier 1: Planner Agent — High-level planning, decomposition & complex reasoning
+  - name: "agent-planner"
+    description: "High-level task decomposition and complex reasoning (reasoning priority)"
+    strategy: "priority-fallback"
+    routing_rules:
+      prefer_capability: "reasoning"
+      enforce_json_mode: true
+      max_latency_ms: 60000
+    models:
+      - provider: "anthropic"
+        model: "claude-sonnet-4-20250514"
+        priority: 1
+        weight: 100
+        params:
+          temperature: 0.2
+          max_tokens: 4096
+      - provider: "openai"
+        model: "o3-mini"
+        priority: 2
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          max_tokens: 4096
+      - provider: "gemini"
+        model: "gemini-2.5-pro"
+        priority: 3
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.2
+          max_tokens: 4096
+      - provider: "deepseek"
+        model: "deepseek-reasoner"
+        priority: 4
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+
+  # Tier 2: Executor Agent — Fast tool calling, scraping orchestration & data formatting
+  - name: "agent-executor"
+    description: "Fast tool calling and data processing (low latency & cost-efficient)"
+    strategy: "priority-fallback"
+    routing_rules:
+      prefer_capability: "tool_calling"
+      max_latency_ms: 15000
+      cost_tier: "low"
+    models:
+      - provider: "gemini"
+        model: "gemini-2.5-flash"
+        priority: 1
+        weight: 100
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+      - provider: "groq"
+        model: "llama-3.3-70b-versatile"
+        priority: 2
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+      - provider: "openai"
+        model: "gpt-4o-mini"
+        priority: 3
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+      - provider: "deepseek"
+        model: "deepseek-chat"
+        priority: 4
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+
+  # Tier 3: Reviewer Agent — Output validation, schema compliance & quality assurance
+  - name: "agent-reviewer"
+    description: "Output validation, hallucination check, and quality assurance"
+    strategy: "priority-fallback"
+    routing_rules:
+      prefer_capability: "evaluation"
+      enforce_json_mode: true
+      max_latency_ms: 30000
+    models:
+      - provider: "openai"
+        model: "gpt-4o"
+        priority: 1
+        weight: 100
+        params:
+          temperature: 0.0
+          max_tokens: 2048
+      - provider: "anthropic"
+        model: "claude-3-5-haiku-latest"
+        priority: 2
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.0
+          max_tokens: 2048
+      - provider: "gemini"
+        model: "gemini-2.5-flash"
+        priority: 3
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.0
+          max_tokens: 2048
+
+observability:
+  track_token_usage: true
+  track_cost_savings: true
+  expose_prometheus_metrics: true
+  metrics_path: "/metrics"
+  health_check_path: "/api/health"

@@ -1,0 +1,124 @@
+services:
+  9router:
+    image: decolua/9router:latest
+    container_name: 9router
+    restart: unless-stopped
+    ports:
+      - "${NINE_ROUTER_PORT:-20128}:20128"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - CONFIG_PATH=/app/config/9router-config.yaml
+    volumes:
+      - ./9router/9router-config.yaml:/app/config/9router-config.yaml:ro
+      - nine_router_data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:20128/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - openmausbot_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: openmausbot-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openmausbot_net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: openmausbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openmausbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-openmausbot_secret_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-openmausbot_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openmausbot} -d ${POSTGRES_DB:-openmausbot_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openmausbot_net
+
+  openmausbot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.openmausbot
+    container_name: openmausbot-api
+    restart: unless-stopped
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      NINE_ROUTER_BASE_URL: http://9router:20128/v1
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-openmausbot}:${POSTGRES_PASSWORD:-openmausbot_secret_change_me}@postgres:5432/${POSTGRES_DB:-openmausbot_db}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      9router:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - openmausbot_net
+
+  openmausbot-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.openmausbot
+    container_name: openmausbot-worker
+    restart: unless-stopped
+    command: ["python", "-m", "worker.main"]
+    env_file:
+      - .env
+    environment:
+      NINE_ROUTER_BASE_URL: http://9router:20128/v1
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-openmausbot}:${POSTGRES_PASSWORD:-openmausbot_secret_change_me}@postgres:5432/${POSTGRES_DB:-openmausbot_db}
+    depends_on:
+      9router:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - openmausbot_net
+
+networks:
+  openmausbot_net:
+    name: openmausbot_net
+    driver: bridge
+
+volumes:
+  nine_router_data:
+  redis_data:
+  postgres_data:
