@@ -42,6 +42,10 @@ class RedisStore:
         _, raw_payload = result
         return TaskRequest.model_validate_json(raw_payload)
 
+    async def get_queue_length(self) -> int:
+        """Return current number of tasks waiting in the Redis queue."""
+        return int(await self._client.llen(self.settings.redis_task_queue_key))
+
     async def set_short_term_memory(
         self,
         task_id: str,

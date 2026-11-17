@@ -2,10 +2,13 @@
 
 import hashlib
 import hmac
+import re
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agent_core.config import get_settings
@@ -70,6 +73,14 @@ app = FastAPI(
     title="OpenMausBot + 9Router Autonomous Agent API",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -255,3 +266,109 @@ async def approval_webhook(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         ) from exc
+
+
+@app.get("/api/v1/metrics/overview")
+async def metrics_overview(request: Request) -> dict[str, Any]:
+    """Aggregate real-time metrics from OpenMausBot DB/Redis and 9Router API."""
+    tasks = await request.app.state.postgres.list_recent_tasks(limit=50)
+    redis_store = request.app.state.redis
+    queue_depth = await redis_store.get_queue_length() if redis_store is not None else 0
+
+    status_counts: dict[str, int] = {s.value: 0 for s in TaskStatus}
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
+
+    # Estimate per-agent token distribution across completed/in-progress stages
+    agent_tokens = {
+        "agent-planner": 0,
+        "agent-executor": 0,
+        "agent-reviewer": 0,
+    }
+
+    active_statuses = {
+        TaskStatus.QUEUED,
+        TaskStatus.PLANNING,
+        TaskStatus.EXECUTING,
+        TaskStatus.AWAITING_APPROVAL,
+        TaskStatus.REVIEWING,
+    }
+    active_tasks: list[dict[str, Any]] = []
+
+    for t in tasks:
+        status_counts[t.status.value] = status_counts.get(t.status.value, 0) + 1
+        total_prompt_tokens += t.token_usage.prompt_tokens
+        total_completion_tokens += t.token_usage.completion_tokens
+        total_tokens += t.token_usage.total_tokens
+
+        # Distribute recorded task tokens proportionally across executed agent stages
+        stages_present = []
+        if t.plan is not None:
+            stages_present.append(("agent-planner", 0.30))
+        if t.execution is not None:
+            stages_present.append(("agent-executor", 0.45))
+        if t.review is not None:
+            stages_present.append(("agent-reviewer", 0.25))
+
+        if stages_present and t.token_usage.total_tokens > 0:
+            weight_sum = sum(w for _, w in stages_present)
+            for agent_name, weight in stages_present:
+                agent_tokens[agent_name] += round(
+                    t.token_usage.total_tokens * (weight / weight_sum)
+                )
+
+        if t.status in active_statuses:
+            active_tasks.append(t.model_dump(mode="json"))
+
+    finished_count = (
+        status_counts[TaskStatus.COMPLETED.value]
+        + status_counts[TaskStatus.FAILED.value]
+        + status_counts[TaskStatus.REJECTED.value]
+        + status_counts[TaskStatus.NEEDS_REVISION.value]
+    )
+    success_count = status_counts[TaskStatus.COMPLETED.value]
+    routing_success_rate = (
+        round((success_count / finished_count) * 100, 1) if finished_count > 0 else 100.0
+    )
+
+    # Query 9Router health & metrics endpoint
+    base_root = re.sub(r"/v1/?$", "", request.app.state.settings.nine_router_base_url)
+    nine_router_status: dict[str, Any] = {
+        "reachable": False,
+        "base_url": request.app.state.settings.nine_router_base_url,
+        "health": None,
+        "rate_limit_429_fallbacks": 0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            health_res = await client.get(f"{base_root}/api/health")
+            if health_res.status_code < 400:
+                nine_router_status["reachable"] = True
+                nine_router_status["health"] = (
+                    health_res.json()
+                    if "application/json" in health_res.headers.get("content-type", "")
+                    else {"status": "ok"}
+                )
+    except Exception:
+        nine_router_status["reachable"] = False
+
+    return {
+        "queue_depth": queue_depth,
+        "total_tasks": len(tasks),
+        "routing_success_rate": routing_success_rate,
+        "status_counts": status_counts,
+        "token_summary": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens,
+        },
+        "agent_tokens": [
+            {"agent": "agent-planner", "label": "Planner", "tokens": agent_tokens["agent-planner"]},
+            {"agent": "agent-executor", "label": "Executor", "tokens": agent_tokens["agent-executor"]},
+            {"agent": "agent-reviewer", "label": "Reviewer", "tokens": agent_tokens["agent-reviewer"]},
+        ],
+        "active_tasks": active_tasks,
+        "recent_tasks": [t.model_dump(mode="json") for t in tasks[:15]],
+        "nine_router": nine_router_status,
+    }
