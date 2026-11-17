@@ -1,8 +1,9 @@
 # 9Router Unified AI Gateway Configuration
 # Compatible with 9Router (decolua/9router) OpenAI-compatible proxy on port 20128.
 # All OpenMausBot agents send requests to http://9router:20128/v1 using virtual model aliases.
+# Zero changes required on OpenMausBot: routing inspects OpenAI payload (`messages`, `tools`).
 
-version: "1.0"
+version: "1.1"
 
 server:
   host: "0.0.0.0"
@@ -13,6 +14,14 @@ server:
 
 # Upstream provider definitions (API keys injected via environment variables)
 providers:
+  # Local / Lightweight Inference Provider (Ollama OpenAI-compatible endpoint)
+  ollama_local:
+    type: "openai-compatible"
+    base_url: "${OLLAMA_BASE_URL:-http://host.docker.internal:11434/v1}"
+    api_key: "ollama"
+    timeout_ms: 20000
+    max_retries: 1
+
   anthropic:
     type: "anthropic"
     api_key: "${ANTHROPIC_API_KEY}"
@@ -62,8 +71,98 @@ resilience:
     on_429_action: "immediate_fallback"
     respect_retry_after_header: true
 
-# Virtual Model Routing Tiers for OpenMausBot
+# Dynamic Context-Length & Tool-Calling Routing Policies
+# Evaluated by 9Router before dispatching to upstream providers (no OpenMausBot code changes).
+routing_policies:
+  token_estimation:
+    method: "cl100k_approx"
+    include_system_prompt: true
+    short_context_threshold_tokens: 2000
+
+  rules:
+    # Rule 1: Short context (< 2000 tokens) AND no tool-calling -> Local / Lightweight model
+    - id: "short-context-no-tools-local"
+      priority: 10
+      description: "Route short prompts (< 2000 tokens) without tool calling to local/lightweight models"
+      match:
+        max_prompt_tokens: 1999
+        has_tools: false
+      target_combo: "tier-local-lightweight"
+
+    # Rule 2: Tool calling required -> Tool-capable fast models
+    - id: "tool-calling-executor"
+      priority: 20
+      description: "Ensure requests with `tools` array always use models with reliable function calling"
+      match:
+        has_tools: true
+      target_combo: "agent-executor"
+
+    # Rule 3: Large context (>= 2000 tokens) -> High-capacity frontier models
+    - id: "large-context-high-capacity"
+      priority: 30
+      description: "Route large context tasks (>= 2000 tokens) to high-capacity context models"
+      match:
+        min_prompt_tokens: 2000
+      target_combo: "tier-high-capacity"
+
+# Virtual Model Routing Tiers for OpenMausBot + Policy Target Pools
 combos:
+  # Pool A: Local & Lightweight Models (< 2000 tokens, no tool calling)
+  - name: "tier-local-lightweight"
+    description: "Local Ollama & ultra-light cloud models for short-context, non-tool tasks"
+    strategy: "priority-fallback"
+    models:
+      - provider: "ollama_local"
+        model: "qwen2.5:7b-instruct"
+        priority: 1
+        weight: 100
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+      - provider: "groq"
+        model: "llama-3.1-8b-instant"
+        priority: 2
+        fallback_on: [429, 500, 502, 503, "connection_refused", "timeout"]
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+      - provider: "gemini"
+        model: "gemini-2.5-flash"
+        priority: 3
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.1
+          max_tokens: 2048
+
+  # Pool B: High-Capacity Context Models (>= 2000 tokens)
+  - name: "tier-high-capacity"
+    description: "Large-context frontier models (128k-1M tokens) for heavy reasoning & large payloads"
+    strategy: "priority-fallback"
+    models:
+      - provider: "anthropic"
+        model: "claude-sonnet-4-20250514"
+        priority: 1
+        context_window: 200000
+        params:
+          temperature: 0.2
+          max_tokens: 4096
+      - provider: "gemini"
+        model: "gemini-2.5-pro"
+        priority: 2
+        context_window: 1000000
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.2
+          max_tokens: 4096
+      - provider: "openai"
+        model: "gpt-4o"
+        priority: 3
+        context_window: 128000
+        fallback_on: [429, 500, 502, 503, "quota_exceeded", "timeout"]
+        params:
+          temperature: 0.2
+          max_tokens: 4096
+
   # Tier 1: Planner Agent — High-level planning, decomposition & complex reasoning
   - name: "agent-planner"
     description: "High-level task decomposition and complex reasoning (reasoning priority)"
@@ -72,6 +171,10 @@ combos:
       prefer_capability: "reasoning"
       enforce_json_mode: true
       max_latency_ms: 60000
+      context_override:
+        if_prompt_tokens_lt: 2000
+        and_has_tools: false
+        use_combo: "tier-local-lightweight"
     models:
       - provider: "anthropic"
         model: "claude-sonnet-4-20250514"
@@ -106,6 +209,9 @@ combos:
       prefer_capability: "tool_calling"
       max_latency_ms: 15000
       cost_tier: "low"
+      context_override:
+        if_prompt_tokens_gte: 2000
+        use_combo: "tier-high-capacity"
     models:
       - provider: "gemini"
         model: "gemini-2.5-flash"
@@ -141,6 +247,10 @@ combos:
       prefer_capability: "evaluation"
       enforce_json_mode: true
       max_latency_ms: 30000
+      context_override:
+        if_prompt_tokens_lt: 2000
+        and_has_tools: false
+        use_combo: "tier-local-lightweight"
     models:
       - provider: "openai"
         model: "gpt-4o"

@@ -22,7 +22,25 @@ def test_9router_config_tiers_and_fallbacks() -> None:
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     combos = {combo["name"]: combo for combo in data["combos"]}
 
-    assert {"agent-planner", "agent-executor", "agent-reviewer"} <= set(combos.keys())
+    assert {
+        "agent-planner",
+        "agent-executor",
+        "agent-reviewer",
+        "tier-local-lightweight",
+        "tier-high-capacity",
+    } <= set(combos.keys())
+
+    # Verify local/lightweight and high-capacity context routing policies
+    policies = data["routing_policies"]
+    assert policies["token_estimation"]["short_context_threshold_tokens"] == 2000
+    rules = {r["id"]: r for r in policies["rules"]}
+    assert rules["short-context-no-tools-local"]["match"] == {
+        "max_prompt_tokens": 1999,
+        "has_tools": False,
+    }
+    assert rules["short-context-no-tools-local"]["target_combo"] == "tier-local-lightweight"
+    assert rules["large-context-high-capacity"]["match"] == {"min_prompt_tokens": 2000}
+    assert rules["large-context-high-capacity"]["target_combo"] == "tier-high-capacity"
 
     for tier_name in ("agent-planner", "agent-executor", "agent-reviewer"):
         models = combos[tier_name]["models"]
