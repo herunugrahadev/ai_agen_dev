@@ -5,6 +5,7 @@ import random
 import time
 from typing import Any
 
+import httpx
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -36,6 +37,10 @@ class NineRouterClient:
             base_url=self.settings.nine_router_base_url,
             api_key=self.settings.nine_router_api_key,
             timeout=self.settings.nine_router_timeout_seconds,
+            http_client=httpx.AsyncClient(
+                timeout=self.settings.nine_router_timeout_seconds,
+                trust_env=False,
+            ),
             # Retries are managed explicitly with jitter & observability logging
             max_retries=0,
         )
