@@ -310,8 +310,16 @@ class ExecutorAgent(BaseAgent):
 
     @staticmethod
     def _safe_parse_json(raw: str) -> dict[str, Any]:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
         try:
-            data = json.loads(raw)
+            data = json.loads(cleaned)
             return data if isinstance(data, dict) else {"summary": raw}
         except json.JSONDecodeError:
             return {"summary": raw, "extracted_data": {}}

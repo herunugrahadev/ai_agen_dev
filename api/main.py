@@ -20,8 +20,11 @@ from agent_core.logging_utils import get_logger, setup_logging
 from agent_core.models import (
     ApprovalWebhookPayload,
     ExecutionEvent,
+    ExecutorOutput,
     InstructionRequest,
     PendingApproval,
+    PlanOutput,
+    SubTask,
     TaskRequest,
     TaskStatus,
     WebhookPayload,
@@ -392,6 +395,7 @@ async def execute_instruction_sse(
 ) -> StreamingResponse:
     """Stream real-time DAG planning and ReAct tool execution via Server-Sent Events (SSE)."""
     llm_client: NineRouterClient = request.app.state.llm_client
+    postgres_store: PostgresStore | None = getattr(request.app.state, "postgres", None)
     registry = getattr(
         request.app.state,
         "instruction_registry",
@@ -400,7 +404,20 @@ async def execute_instruction_sse(
     planner = PlannerAgent(llm_client=llm_client)
     executor = ExecutorAgent(llm_client=llm_client, tool_registry=registry)
 
+    async def _save_state(res: WorkflowResult) -> None:
+        if postgres_store is not None:
+            await postgres_store.save_task_result(res)
+
     async def event_stream() -> AsyncIterator[str]:
+        from datetime import datetime, timezone
+
+        wf_result = WorkflowResult(
+            task_id=payload.task_id,
+            status=TaskStatus.PLANNING,
+            objective=payload.instruction,
+        )
+        await _save_state(wf_result)
+
         try:
             yield _format_sse(
                 ExecutionEvent(
@@ -414,8 +431,15 @@ async def execute_instruction_sse(
                 payload,
                 available_tools=registry.openai_schemas(),
             )
+            wf_result.token_usage.prompt_tokens += plan_usage.prompt_tokens
+            wf_result.token_usage.completion_tokens += plan_usage.completion_tokens
+            wf_result.token_usage.total_tokens += plan_usage.total_tokens
 
             if dag_plan.status == "needs_clarification":
+                wf_result.status = TaskStatus.NEEDS_CLARIFICATION
+                wf_result.completed_at = datetime.now(timezone.utc)
+                await _save_state(wf_result)
+
                 yield _format_sse(
                     ExecutionEvent(
                         event="clarification_needed",
@@ -430,6 +454,24 @@ async def execute_instruction_sse(
                     )
                 )
                 return
+
+            wf_result.plan = PlanOutput(
+                task_id=payload.task_id,
+                goal_summary=dag_plan.goal_summary or payload.instruction,
+                reasoning="DAG instruction plan",
+                subtasks=[
+                    SubTask(
+                        step_id=s.step_id,
+                        title=s.title,
+                        description=s.description,
+                        recommended_tool=s.tool_name,
+                        tool_arguments=s.arguments,
+                    )
+                    for s in dag_plan.steps
+                ],
+            )
+            wf_result.status = TaskStatus.EXECUTING
+            await _save_state(wf_result)
 
             yield _format_sse(
                 ExecutionEvent(
@@ -448,9 +490,36 @@ async def execute_instruction_sse(
                 plan=dag_plan,
                 max_retries_per_step=3,
             ):
+                if exec_event.event == "completed":
+                    tu = exec_event.data.get("token_usage", {})
+                    wf_result.token_usage.prompt_tokens += int(tu.get("prompt_tokens", 0))
+                    wf_result.token_usage.completion_tokens += int(tu.get("completion_tokens", 0))
+                    wf_result.token_usage.total_tokens += int(tu.get("total_tokens", 0))
+                    wf_result.execution = ExecutorOutput(
+                        task_id=payload.task_id,
+                        summary="DAG instruction executed via /api/v1/execute",
+                        extracted_data={
+                            str(k): v
+                            for k, v in exec_event.data.get("results", {}).items()
+                        },
+                    )
+                    wf_result.status = TaskStatus.COMPLETED
+                    wf_result.completed_at = datetime.now(timezone.utc)
+                    await _save_state(wf_result)
+                elif exec_event.event == "failed":
+                    wf_result.status = TaskStatus.FAILED
+                    wf_result.error = exec_event.message
+                    wf_result.completed_at = datetime.now(timezone.utc)
+                    await _save_state(wf_result)
+
                 yield _format_sse(exec_event)
 
         except Exception as exc:
+            wf_result.status = TaskStatus.FAILED
+            wf_result.error = str(exc)
+            wf_result.completed_at = datetime.now(timezone.utc)
+            await _save_state(wf_result)
+
             yield _format_sse(
                 ExecutionEvent(
                     event="failed",

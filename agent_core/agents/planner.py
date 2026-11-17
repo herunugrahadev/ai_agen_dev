@@ -74,11 +74,23 @@ class PlannerAgent(BaseAgent):
         )
 
         raw_content = response.choices[0].message.content or "{}"
-        parsed = json.loads(raw_content)
+        parsed = self._extract_json(raw_content)
         parsed["task_id"] = task.task_id
 
         plan = PlanOutput.model_validate(parsed)
         return plan, usage
+
+    @staticmethod
+    def _extract_json(raw: str) -> dict[str, Any]:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        return json.loads(cleaned)
 
     async def parse_instruction(
         self,
@@ -136,6 +148,6 @@ Return ONLY valid JSON."""
         )
 
         raw_content = response.choices[0].message.content or "{}"
-        parsed = json.loads(raw_content)
+        parsed = self._extract_json(raw_content)
         parsed["task_id"] = request.task_id
         return DagPlanOutput.model_validate(parsed), usage

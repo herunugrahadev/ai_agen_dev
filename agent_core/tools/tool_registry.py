@@ -43,12 +43,14 @@ class WebSearchTool(ValidatedTool):
     input_model = WebSearchInput
     parameters_schema = WebSearchInput.model_json_schema()
 
-    def __init__(self, timeout_seconds: float = 10.0, trust_env: bool = True) -> None:
+    def __init__(self, timeout_seconds: float = 10.0, trust_env: bool = False) -> None:
         self.timeout_seconds = timeout_seconds
         self.trust_env = trust_env
 
     async def execute(self, *, task_id: str, **kwargs: Any) -> dict[str, Any]:
         validated = WebSearchInput.model_validate(kwargs)
+        results: list[dict[str, str]] = []
+
         async with httpx.AsyncClient(
             timeout=self.timeout_seconds,
             follow_redirects=True,
@@ -66,21 +68,41 @@ class WebSearchTool(ValidatedTool):
             resp.raise_for_status()
             data = resp.json()
 
-        results: list[dict[str, str]] = []
-        if data.get("AbstractText"):
-            results.append({
-                "title": data.get("Heading") or validated.query,
-                "snippet": data["AbstractText"],
-                "url": data.get("AbstractURL") or "",
-            })
-
-        for topic in data.get("RelatedTopics", [])[: validated.max_results]:
-            if isinstance(topic, dict) and topic.get("Text"):
+            if data.get("AbstractText"):
                 results.append({
-                    "title": topic.get("Text", "")[:80],
-                    "snippet": topic.get("Text", ""),
-                    "url": topic.get("FirstURL") or "",
+                    "title": data.get("Heading") or validated.query,
+                    "snippet": data["AbstractText"],
+                    "url": data.get("AbstractURL") or "",
                 })
+
+            for topic in data.get("RelatedTopics", [])[: validated.max_results]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append({
+                        "title": topic.get("Text", "")[:80],
+                        "snippet": topic.get("Text", ""),
+                        "url": topic.get("FirstURL") or "",
+                    })
+
+            # Fallback to DuckDuckGo HTML lite if Instant Answer returned no results
+            if not results:
+                html_resp = await client.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": validated.query},
+                    headers={"User-Agent": "OpenMausBot/0.1"},
+                )
+                if html_resp.status_code == 200:
+                    from bs4 import BeautifulSoup
+
+                    soup = BeautifulSoup(html_resp.text, "html.parser")
+                    for item in soup.select(".result")[: validated.max_results]:
+                        title_el = item.select_one(".result__a")
+                        snippet_el = item.select_one(".result__snippet")
+                        if title_el:
+                            results.append({
+                                "title": title_el.get_text(" ", strip=True),
+                                "snippet": snippet_el.get_text(" ", strip=True) if snippet_el else "",
+                                "url": str(title_el.get("href") or ""),
+                            })
 
         return {
             "task_id": task_id,
@@ -245,7 +267,7 @@ class StrictToolRegistry(ToolRegistry):
 def build_default_instruction_registry(
     *,
     workspace_dir: str | Path = "./workspace",
-    trust_env: bool = True,
+    trust_env: bool = False,
 ) -> StrictToolRegistry:
     """Create a StrictToolRegistry pre-loaded with web_search, file_operator, and webhook_dispatcher."""
     return StrictToolRegistry(

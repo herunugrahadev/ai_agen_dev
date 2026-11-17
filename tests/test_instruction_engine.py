@@ -204,8 +204,17 @@ async def test_react_self_correction_and_sse_execute_endpoint(tmp_path: Path) ->
         ]
     )
 
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from agent_core.models import TaskStatus
+    from agent_core.storage.postgres_store import PostgresStore
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    pg_store = PostgresStore(engine=engine)
+    await pg_store.init_db()
+
     app.state.settings = settings
     app.state.llm_client = llm_client
+    app.state.postgres = pg_store
     app.state.instruction_registry = registry
 
     async with httpx.AsyncClient(
@@ -228,3 +237,8 @@ async def test_react_self_correction_and_sse_execute_endpoint(tmp_path: Path) ->
     assert "event: retry" in body
     assert "event: completed" in body
     assert (tmp_path / "news.txt").read_text(encoding="utf-8") == "AI News summary"
+
+    saved = await pg_store.get_task_result("sse-exec-001")
+    assert saved is not None
+    assert saved.status == TaskStatus.COMPLETED
+    await pg_store.close()
