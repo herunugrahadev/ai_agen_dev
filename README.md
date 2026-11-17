@@ -38,6 +38,15 @@ Platform agen AI otonom yang menghubungkan **OpenMausBot** (orkestrasi multi-age
    curl http://localhost:20128/api/health
    ```
 
+## Cara Menjalankan Tanpa Docker (1 Perintah)
+
+Gunakan skrip `scripts/start-local.sh` untuk menjalankan **9Router**, **OpenMausBot API**, **Worker** (jika `redis-server` terpasang; jika tidak, otomatis berjalan dalam mode sinkron dengan SQLite):
+
+```bash
+chmod +x scripts/start-local.sh
+./scripts/start-local.sh
+```
+
 ## Menguji Alur End-to-End
 
 1. **Kirim tugas via REST API (asinkron via Redis Worker):**

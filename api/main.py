@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     postgres_store = PostgresStore(settings=settings)
     await postgres_store.init_db()
-    redis_store = RedisStore(settings=settings)
+    redis_store = RedisStore(settings=settings) if settings.redis_enabled else None
     llm_client = NineRouterClient(settings=settings)
 
     app.state.settings = settings
@@ -55,7 +55,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await llm_client.close()
-        await redis_store.close()
+        if redis_store is not None:
+            await redis_store.close()
         await postgres_store.close()
         logger.info("OpenMausBot API stopped", extra={"event": "api_shutdown"})
 
@@ -71,11 +72,13 @@ app = FastAPI(
 async def health_check(request: Request) -> dict[str, str]:
     """Verify PostgreSQL and Redis readiness."""
     pg_ok = await request.app.state.postgres.ping()
-    redis_ok = await request.app.state.redis.ping()
+    redis_store = request.app.state.redis
+    redis_ok = await redis_store.ping() if redis_store is not None else True
+    redis_status = "disabled" if redis_store is None else ("connected" if redis_ok else "error")
     return {
         "status": "ok" if (pg_ok and redis_ok) else "degraded",
         "postgres": "connected" if pg_ok else "error",
-        "redis": "connected" if redis_ok else "error",
+        "redis": redis_status,
         "nine_router_url": request.app.state.settings.nine_router_base_url,
     }
 
@@ -94,7 +97,7 @@ async def submit_task(
     ),
 ) -> TaskSubmitResponse | WorkflowResult:
     """Enqueue an autonomous agent task (or run synchronously with ?sync=true)."""
-    if sync:
+    if sync or request.app.state.redis is None:
         return await request.app.state.orchestrator.run(task)
 
     initial_state = WorkflowResult(

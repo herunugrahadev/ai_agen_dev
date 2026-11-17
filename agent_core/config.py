@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     model_alias_reviewer: str = Field(default="agent-reviewer")
 
     # Redis (Task Queue & Short-Term Memory)
+    redis_enabled: bool = Field(default=True)
     redis_url: str = Field(default="redis://redis:6379/0")
     redis_task_queue_key: str = Field(default="openmausbot:tasks:queue")
     redis_memory_ttl_seconds: int = Field(default=3600, ge=60)
