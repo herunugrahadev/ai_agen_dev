@@ -12,6 +12,18 @@ Set-Location $RootDir
 
 $BackgroundProcs = @()
 
+function Invoke-NativeSafe {
+    param([scriptblock]$Command)
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command
+    }
+    finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
+
 try {
     # 1. Pastikan .env tersedia
     if (-not (Test-Path ".env")) {
@@ -20,31 +32,41 @@ try {
     }
 
     # 2. Override environment agar berjalan di localhost (SQLite default jika tidak pakai PostgreSQL)
-    if (-not $env:NINE_ROUTER_BASE_URL) { $env:NINE_ROUTER_BASE_URL = "http://localhost:20128/v1" }
-    if (-not $env:REDIS_URL) { $env:REDIS_URL = "redis://localhost:6379/0" }
+    $env:NINE_ROUTER_BASE_URL = "http://localhost:20128/v1"
+    $env:REDIS_URL = "redis://localhost:6379/0"
     if (-not $env:DATABASE_URL) { $env:DATABASE_URL = "sqlite+aiosqlite:///./openmausbot.db" }
 
     # 3. Siapkan Python virtual environment (.venv)
-    if (-not (Test-Path ".venv")) {
+    $VenvPython = Join-Path $RootDir ".venv\Scripts\python.exe"
+    if (-not (Test-Path $VenvPython)) {
         Write-Host ">>> Membuat Python virtual environment (.venv)..." -ForegroundColor Cyan
         if (Get-Command uv -ErrorAction SilentlyContinue) {
-            uv venv .venv
+            Invoke-NativeSafe { uv venv .venv }
+        } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+            Invoke-NativeSafe { py -3 -m venv .venv }
+        } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+            Invoke-NativeSafe { python -m venv .venv }
         } else {
-            python -m venv .venv
+            throw "Python 3.11+ tidak ditemukan di PATH. Install Python dari https://www.python.org/downloads/ terlebih dahulu."
+        }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $VenvPython)) {
+            throw "Gagal membuat virtual environment di .venv."
         }
     }
 
-    $VenvPython = Join-Path $RootDir ".venv\Scripts\python.exe"
-    $VenvUvicorn = Join-Path $RootDir ".venv\Scripts\uvicorn.exe"
-
-    # Install dependensi jika belum terpasang
-    & $VenvPython -c "import fastapi, openai, aiosqlite" 2>$null
+    # Cek dependensi tanpa menulis error ke stderr (menghindari NativeCommandError di PS 5.1)
+    Invoke-NativeSafe {
+        & $VenvPython -c "import importlib.util, sys; mods=('fastapi','uvicorn','openai','aiosqlite'); sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)"
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ">>> Menginstall dependensi Python..." -ForegroundColor Cyan
         if (Get-Command uv -ErrorAction SilentlyContinue) {
-            uv pip install -e ".[dev]"
+            Invoke-NativeSafe { uv pip install --python $VenvPython -e ".[dev]" }
         } else {
-            & $VenvPython -m pip install -e ".[dev]"
+            Invoke-NativeSafe { & $VenvPython -m pip install -e ".[dev]" }
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Gagal menginstall dependensi Python."
         }
     }
 
@@ -82,7 +104,7 @@ try {
     # 7. Jalankan OpenMausBot API & Webhook (foreground)
     Write-Host ">>> Menjalankan OpenMausBot API di http://localhost:8000 ..." -ForegroundColor Green
     Write-Host ">>> Tekan Ctrl+C untuk menghentikan semua layanan." -ForegroundColor Green
-    & $VenvUvicorn api.main:app --host 0.0.0.0 --port 8000
+    Invoke-NativeSafe { & $VenvPython -m uvicorn api.main:app --host 0.0.0.0 --port 8000 }
 }
 finally {
     Write-Host ""
