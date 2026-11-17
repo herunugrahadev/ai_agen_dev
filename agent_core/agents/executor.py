@@ -1,6 +1,8 @@
 """ExecutorAgent: executes subtasks using custom tools with HITL approval gating."""
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,7 +11,11 @@ from agent_core.config import get_settings
 from agent_core.llm_client import NineRouterClient
 from agent_core.logging_utils import get_logger
 from agent_core.models import (
+    DagPlanOutput,
+    DagStep,
+    ExecutionEvent,
     ExecutorOutput,
+    InstructionRequest,
     PendingApproval,
     PlanOutput,
     TaskRequest,
@@ -309,3 +315,216 @@ class ExecutorAgent(BaseAgent):
             return data if isinstance(data, dict) else {"summary": raw}
         except json.JSONDecodeError:
             return {"summary": raw, "extracted_data": {}}
+
+    async def execute_dag_react(
+        self,
+        *,
+        request: InstructionRequest,
+        plan: DagPlanOutput,
+        max_retries_per_step: int = 3,
+    ) -> AsyncIterator[ExecutionEvent]:
+        """Execute a DAG plan with parallel wave scheduling and ReAct self-correction."""
+        pending_steps: dict[int, DagStep] = {s.step_id: s for s in plan.steps}
+        completed_outputs: dict[int, dict[str, Any]] = {}
+        total_usage = TokenUsage()
+
+        while pending_steps:
+            ready_steps = [
+                step
+                for step in pending_steps.values()
+                if all(dep in completed_outputs for dep in step.depends_on)
+            ]
+            if not ready_steps:
+                yield ExecutionEvent(
+                    event="failed",
+                    task_id=request.task_id,
+                    message="DAG deadlock: cyclic or unsatisfied step dependencies.",
+                )
+                return
+
+            # Run ready wave steps concurrently
+            wave_tasks = [
+                self._execute_step_react(
+                    task_id=request.task_id,
+                    step=step,
+                    prior_outputs=completed_outputs,
+                    max_retries=max_retries_per_step,
+                )
+                for step in ready_steps
+            ]
+            wave_results = await asyncio.gather(*wave_tasks)
+
+            for step, step_events, step_output, step_usage, succeeded in wave_results:
+                total_usage.prompt_tokens += step_usage.prompt_tokens
+                total_usage.completion_tokens += step_usage.completion_tokens
+                total_usage.total_tokens += step_usage.total_tokens
+
+                for ev in step_events:
+                    yield ev
+
+                if not succeeded:
+                    yield ExecutionEvent(
+                        event="failed",
+                        task_id=request.task_id,
+                        step_id=step.step_id,
+                        message=f"Step {step.step_id} ({step.tool_name}) failed after {max_retries_per_step} retries.",
+                    )
+                    return
+
+                completed_outputs[step.step_id] = step_output
+                pending_steps.pop(step.step_id, None)
+
+        yield ExecutionEvent(
+            event="completed",
+            task_id=request.task_id,
+            message="Selesai",
+            data={
+                "results": completed_outputs,
+                "token_usage": total_usage.model_dump(),
+            },
+        )
+
+    async def _execute_step_react(
+        self,
+        *,
+        task_id: str,
+        step: DagStep,
+        prior_outputs: dict[int, dict[str, Any]],
+        max_retries: int,
+    ) -> tuple[DagStep, list[ExecutionEvent], dict[str, Any], TokenUsage, bool]:
+        """Run ReAct Thought -> Action -> Observation loop with self-correction retries."""
+        events: list[ExecutionEvent] = []
+        step_usage = TokenUsage()
+        current_args = dict(step.arguments)
+        thought = f"Menjalankan langkah {step.step_id}: {step.title} menggunakan {step.tool_name}."
+
+        for attempt in range(1, max_retries + 1):
+            events.append(
+                ExecutionEvent(
+                    event="thought",
+                    task_id=task_id,
+                    step_id=step.step_id,
+                    message=thought,
+                    data={"attempt": attempt},
+                )
+            )
+            events.append(
+                ExecutionEvent(
+                    event="action",
+                    task_id=task_id,
+                    step_id=step.step_id,
+                    message=f"Menjalankan {step.tool_name}...",
+                    data={"tool_name": step.tool_name, "arguments": current_args},
+                )
+            )
+
+            record = await self.tool_registry.execute_tool(
+                task_id=task_id,
+                tool_name=step.tool_name,
+                arguments=current_args,
+            )
+
+            events.append(
+                ExecutionEvent(
+                    event="observation",
+                    task_id=task_id,
+                    step_id=step.step_id,
+                    message=(
+                        f"{step.tool_name} berhasil."
+                        if record.success
+                        else f"{step.tool_name} gagal: {record.output}"
+                    ),
+                    data={
+                        "success": record.success,
+                        "output": record.output,
+                        "latency_ms": record.latency_ms,
+                    },
+                )
+            )
+
+            if record.success:
+                output_dict = (
+                    record.output
+                    if isinstance(record.output, dict)
+                    else {"result": record.output}
+                )
+                return step, events, output_dict, step_usage, True
+
+            if attempt >= max_retries:
+                break
+
+            # Self-correction via 9Router (tier: agent-executor)
+            thought, current_args, corr_usage = await self._self_correct_arguments(
+                task_id=task_id,
+                step=step,
+                failed_args=current_args,
+                error_observation=record.output,
+                prior_outputs=prior_outputs,
+            )
+            step_usage.prompt_tokens += corr_usage.prompt_tokens
+            step_usage.completion_tokens += corr_usage.completion_tokens
+            step_usage.total_tokens += corr_usage.total_tokens
+
+            events.append(
+                ExecutionEvent(
+                    event="retry",
+                    task_id=task_id,
+                    step_id=step.step_id,
+                    message=f"Memperbaiki parameter {step.tool_name} (percobaan {attempt + 1}/{max_retries})...",
+                    data={"corrected_arguments": current_args, "thought": thought},
+                )
+            )
+
+        return step, events, {}, step_usage, False
+
+    async def _self_correct_arguments(
+        self,
+        *,
+        task_id: str,
+        step: DagStep,
+        failed_args: dict[str, Any],
+        error_observation: Any,
+        prior_outputs: dict[int, dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], TokenUsage]:
+        """Ask 9Router (agent-executor) to repair invalid tool arguments from error observation."""
+        tool = self.tool_registry.get(step.tool_name)
+        tool_schema = tool.to_openai_schema() if tool is not None else {}
+
+        prompt_payload = {
+            "step": step.model_dump(mode="json"),
+            "failed_arguments": failed_args,
+            "error_observation": error_observation,
+            "tool_schema": tool_schema,
+            "prior_step_outputs": prior_outputs,
+        }
+
+        response, usage = await self.llm_client.chat_completion(
+            model_alias=self.model_alias,
+            agent_id=self.agent_id,
+            task_id=task_id,
+            temperature=0.0,
+            max_tokens=1024,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a self-correcting ReAct Executor Agent. "
+                        "A tool call failed. Analyze the error_observation and tool_schema, "
+                        "then return ONLY valid JSON: "
+                        '{"thought": "why it failed and how you fixed it", "arguments": {...}}'
+                    ),
+                },
+                {"role": "user", "content": json.dumps(prompt_payload, default=str)},
+            ],
+        )
+
+        raw = response.choices[0].message.content or "{}"
+        parsed = self._safe_parse_json(raw)
+        fixed_thought = str(parsed.get("thought", "Memperbaiki argumen berdasarkan error."))
+        fixed_args = (
+            parsed.get("arguments")
+            if isinstance(parsed.get("arguments"), dict)
+            else failed_args
+        )
+        return fixed_thought, fixed_args, usage

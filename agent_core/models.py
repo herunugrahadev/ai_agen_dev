@@ -139,3 +139,53 @@ class WorkflowResult(BaseModel):
     error: str | None = None
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
+
+
+class InstructionRequest(BaseModel):
+    """Natural language instruction submitted to POST /api/v1/execute."""
+
+    task_id: str = Field(default_factory=lambda: str(uuid4()))
+    instruction: str = Field(..., min_length=3, description="Natural language instruction")
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class DagStep(BaseModel):
+    """Single node in the DAG execution plan."""
+
+    step_id: int = Field(..., ge=1)
+    title: str
+    description: str
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[int] = Field(default_factory=list)
+
+
+class DagPlanOutput(BaseModel):
+    """Structured planner output supporting DAG steps or NEEDS_CLARIFICATION."""
+
+    task_id: str
+    status: Literal["ready", "needs_clarification"] = "ready"
+    goal_summary: str = ""
+    clarification_questions: list[str] = Field(default_factory=list)
+    steps: list[DagStep] = Field(default_factory=list)
+
+
+class ExecutionEvent(BaseModel):
+    """Real-time SSE event emitted during instruction planning and ReAct execution."""
+
+    event: Literal[
+        "status",
+        "clarification_needed",
+        "plan_ready",
+        "thought",
+        "action",
+        "observation",
+        "retry",
+        "completed",
+        "failed",
+    ]
+    task_id: str
+    message: str
+    step_id: int | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

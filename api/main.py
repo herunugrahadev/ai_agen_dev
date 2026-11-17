@@ -9,13 +9,18 @@ from typing import Any, AsyncIterator
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from agent_core.agents.executor import ExecutorAgent
+from agent_core.agents.planner import PlannerAgent
 from agent_core.config import get_settings
 from agent_core.llm_client import NineRouterClient
 from agent_core.logging_utils import get_logger, setup_logging
 from agent_core.models import (
     ApprovalWebhookPayload,
+    ExecutionEvent,
+    InstructionRequest,
     PendingApproval,
     TaskRequest,
     TaskStatus,
@@ -24,6 +29,7 @@ from agent_core.models import (
 )
 from agent_core.storage.postgres_store import PostgresStore
 from agent_core.storage.redis_store import RedisStore
+from agent_core.tools.tool_registry import build_default_instruction_registry
 from agent_core.workflow.orchestrator import (
     ApprovalNotFoundError,
     WorkflowOrchestrator,
@@ -372,3 +378,93 @@ async def metrics_overview(request: Request) -> dict[str, Any]:
         "recent_tasks": [t.model_dump(mode="json") for t in tasks[:15]],
         "nine_router": nine_router_status,
     }
+
+
+def _format_sse(event: ExecutionEvent) -> str:
+    """Format an ExecutionEvent as a standard Server-Sent Event frame."""
+    return f"event: {event.event}\ndata: {event.model_dump_json()}\n\n"
+
+
+@app.post("/api/v1/execute")
+async def execute_instruction_sse(
+    payload: InstructionRequest,
+    request: Request,
+) -> StreamingResponse:
+    """Stream real-time DAG planning and ReAct tool execution via Server-Sent Events (SSE)."""
+    llm_client: NineRouterClient = request.app.state.llm_client
+    registry = getattr(
+        request.app.state,
+        "instruction_registry",
+        build_default_instruction_registry(),
+    )
+    planner = PlannerAgent(llm_client=llm_client)
+    executor = ExecutorAgent(llm_client=llm_client, tool_registry=registry)
+
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            yield _format_sse(
+                ExecutionEvent(
+                    event="status",
+                    task_id=payload.task_id,
+                    message="Sedang menyusun rencana...",
+                )
+            )
+
+            dag_plan, plan_usage = await planner.parse_instruction(
+                payload,
+                available_tools=registry.openai_schemas(),
+            )
+
+            if dag_plan.status == "needs_clarification":
+                yield _format_sse(
+                    ExecutionEvent(
+                        event="clarification_needed",
+                        task_id=payload.task_id,
+                        message="Instruksi membutuhkan klarifikasi tambahan.",
+                        data={
+                            "status": TaskStatus.NEEDS_CLARIFICATION.value,
+                            "goal_summary": dag_plan.goal_summary,
+                            "clarification_questions": dag_plan.clarification_questions,
+                            "token_usage": plan_usage.model_dump(),
+                        },
+                    )
+                )
+                return
+
+            yield _format_sse(
+                ExecutionEvent(
+                    event="plan_ready",
+                    task_id=payload.task_id,
+                    message=f"Rencana siap ({len(dag_plan.steps)} langkah).",
+                    data={
+                        "plan": dag_plan.model_dump(mode="json"),
+                        "token_usage": plan_usage.model_dump(),
+                    },
+                )
+            )
+
+            async for exec_event in executor.execute_dag_react(
+                request=payload,
+                plan=dag_plan,
+                max_retries_per_step=3,
+            ):
+                yield _format_sse(exec_event)
+
+        except Exception as exc:
+            yield _format_sse(
+                ExecutionEvent(
+                    event="failed",
+                    task_id=payload.task_id,
+                    message=f"Eksekusi gagal: {exc}",
+                )
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

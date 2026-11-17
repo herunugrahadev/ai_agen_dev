@@ -6,7 +6,13 @@ from typing import Any
 from agent_core.agents.base import BaseAgent
 from agent_core.config import get_settings
 from agent_core.llm_client import NineRouterClient
-from agent_core.models import PlanOutput, TaskRequest, TokenUsage
+from agent_core.models import (
+    DagPlanOutput,
+    InstructionRequest,
+    PlanOutput,
+    TaskRequest,
+    TokenUsage,
+)
 
 PLANNER_SYSTEM_PROMPT = """You are the Planner Agent in OpenMausBot.
 Your job is to decompose a user's objective into a clear, ordered list of executable subtasks.
@@ -73,3 +79,63 @@ class PlannerAgent(BaseAgent):
 
         plan = PlanOutput.model_validate(parsed)
         return plan, usage
+
+    async def parse_instruction(
+        self,
+        request: InstructionRequest,
+        available_tools: list[dict[str, Any]],
+    ) -> tuple[DagPlanOutput, TokenUsage]:
+        """Parse natural language instruction into a DAG plan or NEEDS_CLARIFICATION."""
+        system_prompt = """You are the Intent & DAG Task Planner in OpenMausBot.
+Analyze the user's natural language instruction and the available tools.
+If the instruction is ambiguous or missing mandatory parameters (e.g., missing recipient email,
+missing webhook URL, unclear target), you MUST return:
+{
+  "status": "needs_clarification",
+  "goal_summary": "what the user seems to want",
+  "clarification_questions": ["specific question 1", ...],
+  "steps": []
+}
+
+Otherwise, decompose the instruction into a valid DAG (Directed Acyclic Graph) of steps:
+{
+  "status": "ready",
+  "goal_summary": "concise summary",
+  "clarification_questions": [],
+  "steps": [
+    {
+      "step_id": 1,
+      "title": "short title",
+      "description": "step instruction",
+      "tool_name": "one of the available tool names",
+      "arguments": {},
+      "depends_on": []
+    }
+  ]
+}
+Return ONLY valid JSON."""
+
+        user_payload = {
+            "task_id": request.task_id,
+            "instruction": request.instruction,
+            "context": request.context,
+            "available_tools": available_tools,
+        }
+
+        response, usage = await self.llm_client.chat_completion(
+            model_alias=self.model_alias,
+            agent_id=self.agent_id,
+            task_id=request.task_id,
+            temperature=0.1,
+            max_tokens=2048,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload)},
+            ],
+        )
+
+        raw_content = response.choices[0].message.content or "{}"
+        parsed = json.loads(raw_content)
+        parsed["task_id"] = request.task_id
+        return DagPlanOutput.model_validate(parsed), usage
